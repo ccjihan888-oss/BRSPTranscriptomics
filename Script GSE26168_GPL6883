@@ -1,0 +1,313 @@
+# Version info: R 4.5.2, Biobase 2.58.0, GEOquery 2.66.0, limma 3.54.0
+#   Differential expression analysis with limma
+library(GEOquery)
+library(limma)
+library(umap)
+
+# load series and platform data from GEO
+
+gset <- getGEO("GSE26168", GSEMatrix =TRUE, AnnotGPL=TRUE)
+if (length(gset) > 1) idx <- grep("GPL6883", attr(gset, "names")) else idx <- 1
+gset <- gset[[idx]]
+
+# make proper column names to match toptable 
+fvarLabels(gset) <- make.names(fvarLabels(gset))
+
+# group membership for all samples
+gsms <- "000000001111111111111111"
+sml <- strsplit(gsms, split="")[[1]]
+
+# log2 transformation
+ex <- exprs(gset)
+qx <- as.numeric(quantile(ex, c(0., 0.25, 0.5, 0.75, 0.99, 1.0), na.rm=T))
+LogC <- (qx[5] > 100) ||
+  (qx[6]-qx[1] > 50 && qx[2] > 0)
+if (LogC) { ex[which(ex <= 0)] <- NaN
+exprs(gset) <- log2(ex) }
+
+# assign samples to groups and set up design matrix
+gs <- factor(sml)
+groups <- make.names(c("Kontrol","Diabetes Mellitus"))
+levels(gs) <- groups
+gset$group <- gs
+design <- model.matrix(~group + 0, gset)
+colnames(design) <- levels(gs)
+
+gset <- gset[complete.cases(exprs(gset)), ] # skip missing values
+
+fit <- lmFit(gset, design)  # fit linear model
+
+# set up contrasts of interest and recalculate model coefficients
+cts <- paste(groups[1], groups[2], sep="-")
+cont.matrix <- makeContrasts(contrasts=cts, levels=design)
+fit2 <- contrasts.fit(fit, cont.matrix)
+
+# Install & load package yang dibutuhkan
+# install.packages(c("ggplot2", "ggrepel", "pheatmap", "RColorBrewer", "dplyr"))
+library(ggplot2)
+library(ggrepel)
+library(pheatmap)
+library(RColorBrewer)
+library(dplyr)
+
+# Reset semua device & par di awal agar bersih
+graphics.off()
+par(mar = c(5, 4, 4, 2) + 0.1)
+
+# ================================================================
+# compute statistics and table of top significant genes
+# ================================================================
+fit2 <- eBayes(fit2, 0.01)
+tT   <- topTable(fit2, adjust="fdr", sort.by="B", number=250)
+
+message("Kolom tersedia di tT: ", paste(colnames(tT), collapse=", "))
+
+stat_cols    <- c("adj.P.Val", "P.Value", "t", "B", "logFC")
+annot_cols   <- c("ID", "GI", "SEQUENCE", "GB_ACC", "Gene.symbol", "Gene.title")
+desired_cols <- c(stat_cols, annot_cols)
+available_cols <- colnames(tT)[colnames(tT) %in% desired_cols]
+
+if (length(intersect(annot_cols, colnames(tT))) == 0) {
+  message("Kolom anotasi tidak ditemukan di tT, mengambil dari fData(gset)...")
+  fdata           <- fData(gset)
+  annot_available <- colnames(fdata)[colnames(fdata) %in% annot_cols]
+  if (length(annot_available) > 0) {
+    tT            <- merge(tT, fdata[, annot_available, drop=FALSE],
+                           by="row.names", all.x=TRUE)
+    rownames(tT)  <- tT$Row.names
+    tT$Row.names  <- NULL
+  }
+  available_cols <- colnames(tT)[colnames(tT) %in% desired_cols]
+}
+
+missing_cols <- setdiff(desired_cols, colnames(tT))
+if (length(missing_cols) > 0)
+  message("Kolom tidak ditemukan dan dilewati: ", paste(missing_cols, collapse=", "))
+
+tT_out <- tT[, available_cols, drop=FALSE]
+write.table(tT_out, file=stdout(), row.names=FALSE, sep="\t")
+
+# ================================================================
+# Ambil semua hasil topTable untuk visualisasi
+# ================================================================
+tT2 <- topTable(fit2, adjust="fdr", sort.by="B", number=Inf)
+
+# Tambah kolom status DEG
+tT2$DE_status <- "Not Significant"
+tT2$DE_status[tT2$adj.P.Val < 0.05 & tT2$logFC >  1] <- "Up-regulated"
+tT2$DE_status[tT2$adj.P.Val < 0.05 & tT2$logFC < -1] <- "Down-regulated"
+tT2$DE_status <- factor(tT2$DE_status,
+                        levels = c("Up-regulated", "Down-regulated", "Not Significant"))
+
+# Tambah label gen untuk volcano (hanya top 20 signifikan)
+tT2$gene_label <- ""
+if ("Gene.symbol" %in% colnames(tT2)) {
+  sig_idx <- which(tT2$adj.P.Val < 0.05 & abs(tT2$logFC) > 1)
+  top_idx <- head(sig_idx[order(tT2$adj.P.Val[sig_idx])], 20)
+  tT2$gene_label[top_idx] <- as.character(tT2$Gene.symbol[top_idx])
+}
+
+# ================================================================
+# 1. Histogram P-value (base R)
+# ================================================================
+par(mar = c(5, 4, 4, 2) + 0.1)
+hist(tT2$adj.P.Val, col="grey", border="white",
+     xlab="P-adj", ylab="Number of genes",
+     main="P-adj value distribution")
+
+# ================================================================
+# 2. Decide Tests & Venn Diagram (base R)
+# ================================================================
+dT <- decideTests(fit2, adjust.method="fdr", p.value=0.05, lfc=0)
+
+par(mar = c(5, 4, 4, 2) + 0.1)
+vennDiagram(dT, circle.col=palette())
+
+# ================================================================
+# 3. Q-Q Plot (base R)
+# ================================================================
+t.good <- which(!is.na(fit2$F))
+par(mar = c(5, 4, 4, 2) + 0.1)
+qqt(fit2$t[t.good], fit2$df.total[t.good], main="Moderated t statistic")
+
+# ================================================================
+# 4. Volcano Plot limma bawaan (base R)
+# ================================================================
+ct <- 1
+par(mar = c(5, 4, 4, 2) + 0.1)
+volcanoplot(fit2, coef=ct, main=colnames(fit2)[ct], pch=20,
+            highlight=length(which(dT[,ct]!=0)),
+            names=rep('+', nrow(fit2)))
+
+# ================================================================
+# 5. MD Plot (base R)
+# ================================================================
+par(mar = c(5, 4, 4, 2) + 0.1)
+plotMD(fit2, column=ct, status=dT[,ct], legend=FALSE, pch=20, cex=1)
+abline(h=0)
+
+# ================================================================
+# 6. Enhanced Volcano Plot (ggplot2)
+# PENTING: ggplot2 tidak pakai dev.new() - langsung print()
+# ================================================================
+p_volcano <- ggplot(tT2, aes(x=logFC, y=-log10(adj.P.Val), color=DE_status)) +
+  geom_point(alpha=0.6, size=1.5) +
+  # label dipisah dengan subset agar tidak trigger aesthetic warning
+  geom_text_repel(
+    data        = subset(tT2, gene_label != ""),
+    aes(label   = gene_label),
+    size        = 3,
+    max.overlaps= 20,
+    box.padding = 0.4,
+    show.legend = FALSE
+  ) +
+  scale_color_manual(values = c("Up-regulated"    = "#E41A1C",
+                                "Down-regulated"  = "#377EB8",
+                                "Not Significant" = "grey60")) +
+  geom_vline(xintercept  = c(-1, 1),     linetype="dashed", color="black", linewidth=0.4) +
+  geom_hline(yintercept  = -log10(0.05), linetype="dashed", color="black", linewidth=0.4) +
+  labs(title    = "Volcano Plot - GSE26168",
+       subtitle = "Kontrol vs Diabetes Mellitus",
+       x        = "log2 Fold Change",
+       y        = "-log10 (adj. P-value)",
+       color    = "Expression") +
+  theme_bw(base_size=13) +
+  theme(plot.title      = element_text(face="bold", hjust=0.5),
+        plot.subtitle   = element_text(hjust=0.5),
+        legend.position = "top")
+
+print(p_volcano)
+
+# ================================================================
+# 7. Heatmap Top 50 DEG (pheatmap)
+# Reset par sebelum pheatmap agar tidak ada sisa margin
+# ================================================================
+par(mar = c(5, 4, 4, 2) + 0.1)
+
+tT_sig  <- topTable(fit2, adjust="fdr", sort.by="B", number=50)
+ex_heat <- exprs(gset)[rownames(tT_sig), ]
+
+col_annot    <- data.frame(Group = gs)
+rownames(col_annot) <- colnames(ex_heat)
+annot_colors <- list(Group = c(Kontrol           = "#1B9E77",
+                               Diabetes.Mellitus = "#7570B3"))
+
+if ("Gene.symbol" %in% colnames(tT_sig)) {
+  gene_labels <- ifelse(
+    is.na(tT_sig$Gene.symbol) | tT_sig$Gene.symbol == "",
+    rownames(tT_sig), as.character(tT_sig$Gene.symbol)
+  )
+  rownames(ex_heat) <- make.unique(gene_labels)
+}
+
+pheatmap(ex_heat,
+         annotation_col    = col_annot,
+         annotation_colors = annot_colors,
+         scale             = "row",
+         clustering_method = "complete",
+         color             = colorRampPalette(rev(brewer.pal(11, "RdBu")))(100),
+         show_rownames     = TRUE,
+         show_colnames     = TRUE,
+         fontsize_row      = 7,
+         fontsize_col      = 8,
+         main              = "Heatmap Top 50 DEG - GSE26168")
+
+# ================================================================
+# 8. PCA Plot (ggplot2)
+# stat_ellipse hanya ditambahkan jika tiap grup >= 3 sampel
+# ================================================================
+ex_pca <- exprs(gset)
+ex_pca <- na.omit(ex_pca)
+ex_pca <- ex_pca[!duplicated(ex_pca), ]
+
+pca_res <- prcomp(t(ex_pca), scale.=TRUE)
+pca_df  <- as.data.frame(pca_res$x[, 1:2])
+pca_df$Group  <- gs
+pca_df$Sample <- rownames(pca_df)
+pct_var <- round(100 * summary(pca_res)$importance[2, 1:2], 1)
+
+# Cek jumlah sampel per group (stat_ellipse butuh minimal 3)
+n_per_group <- table(pca_df$Group)
+use_ellipse <- all(n_per_group >= 3)
+
+p_pca <- ggplot(pca_df, aes(x=PC1, y=PC2, color=Group)) +
+  geom_point(size=3.5, alpha=0.85) +
+  geom_text_repel(aes(label=Sample),
+                  size=2.8, max.overlaps=15, show.legend=FALSE) +
+  scale_color_manual(values = c(Kontrol           = "#1B9E77",
+                                Diabetes.Mellitus = "#7570B3")) +
+  labs(title    = "PCA Plot - GSE26168",
+       subtitle = "Kontrol vs Diabetes Mellitus",
+       x        = paste0("PC1 (", pct_var[1], "%)"),
+       y        = paste0("PC2 (", pct_var[2], "%)"),
+       color    = "Group") +
+  theme_bw(base_size=13) +
+  theme(plot.title      = element_text(face="bold", hjust=0.5),
+        plot.subtitle   = element_text(hjust=0.5),
+        legend.position = "right")
+
+if (use_ellipse) {
+  p_pca <- p_pca +
+    stat_ellipse(aes(group=Group), linetype="dashed", linewidth=0.5)
+}
+
+print(p_pca)
+
+# ================================================================
+# 9. Bar Plot DEG Up/Down (ggplot2)
+# ================================================================
+deg_counts           <- as.data.frame(table(tT2$DE_status))
+colnames(deg_counts) <- c("Status", "Count")
+deg_counts           <- deg_counts[deg_counts$Status != "Not Significant", ]
+deg_counts$Count     <- as.numeric(deg_counts$Count)
+
+p_bar <- ggplot(deg_counts, aes(x=Status, y=Count, fill=Status)) +
+  geom_bar(stat="identity", width=0.5, show.legend=FALSE) +
+  geom_text(aes(label=Count), vjust=-0.5, size=4.5, fontface="bold") +
+  scale_fill_manual(values = c("Up-regulated"   = "#E41A1C",
+                               "Down-regulated" = "#377EB8")) +
+  labs(title    = "Jumlah DEG Signifikan",
+       subtitle = "adj.P.Val < 0.05 & |logFC| > 1",
+       x="", y="Jumlah Gen") +
+  theme_bw(base_size=13) +
+  theme(plot.title      = element_text(face="bold", hjust=0.5),
+        plot.subtitle   = element_text(hjust=0.5))
+
+print(p_bar)
+
+# ================================================================
+# 10. General expression data analysis (base R)
+# ================================================================
+ex  <- exprs(gset)
+ord <- order(gs)
+palette(c("#1B9E77", "#7570B3", "#E7298A", "#E6AB02", "#D95F02",
+          "#66A61E", "#A6761D", "#B32424", "#B324B3", "#666666"))
+
+# Box-and-whisker plot
+par(mar = c(7, 4, 2, 1))
+title <- paste("GSE26168", "/", annotation(gset), sep="")
+boxplot(ex[,ord], boxwex=0.6, notch=TRUE, main=title,
+        outline=FALSE, las=2, col=gs[ord])
+legend("topleft", groups, fill=palette(), bty="n")
+
+# Expression value distribution
+par(mar = c(4, 4, 2, 1))
+title <- paste("GSE26168", "/", annotation(gset), " value distribution", sep="")
+plotDensities(ex, group=gs, main=title, legend="topright")
+
+# UMAP plot
+ex  <- na.omit(ex)
+ex  <- ex[!duplicated(ex), ]
+ump <- umap(t(ex), n_neighbors=10, random_state=123)
+
+par(mar = c(3, 3, 2, 6), xpd=TRUE)
+plot(ump$layout, main="UMAP plot, nbrs=10", xlab="", ylab="",
+     col=gs, pch=20, cex=1.5)
+legend("topright", inset=c(-0.15, 0), legend=levels(gs), pch=20,
+       col=1:nlevels(gs), title="Group", pt.cex=1.5)
+with(as.data.frame(ump$layout),
+     text(V1, V2, labels=rownames(ump$layout), cex=0.6, pos=3))
+
+# Mean-variance trend
+par(mar = c(5, 4, 4, 2) + 0.1)
+plotSA(fit2, main="Mean variance trend, GSE26168")
